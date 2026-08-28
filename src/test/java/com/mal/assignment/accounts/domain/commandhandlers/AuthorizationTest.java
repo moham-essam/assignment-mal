@@ -11,6 +11,7 @@ import com.mal.assignment.accounts.domain.models.Currency;
 import com.mal.assignment.accounts.domain.models.FailureReason;
 import com.mal.assignment.accounts.domain.models.LedgerDomainException;
 import com.mal.assignment.accounts.domain.services.AuthorizationService;
+import com.mal.assignment.accounts.infrastructure.buses.InMemoryCommandBus;
 import com.mal.assignment.support.StubUnitOfWork;
 import org.junit.jupiter.api.Test;
 
@@ -54,10 +55,23 @@ class AuthorizationTest {
                 account,
                 LedgerDomainException.of(FailureReason.CONCURRENT_MODIFICATION, "commit failed")
         );
-        AuthorizationService authorizationService = new AuthorizationService(stub);
+        AuthorizationService authorizationService = new AuthorizationService(stub, new InMemoryCommandBus());
         AuthorizeCommandHandler handler = new AuthorizeCommandHandler(authorizationService);
         CommandResult result = handler.handle(new AuthorizeCommand("E3", "ACC-001", "Auth-A", 20_000L));
         assertTrue(result.failed());
         assertEquals(FailureReason.CONCURRENT_MODIFICATION, result.error().orElseThrow().reason());
+    }
+
+    @Test
+    void exactAvailableIsApproved() {
+        AccountsModule module = AccountsModule.shipped();
+        module.commandBus().dispatch(new OpenAccountCommand("open", "ACC-001", Currency.AED, 0L));
+        module.commandBus().dispatch(new BookCreditCommand("E1", "ACC-001", 1, 20_000L, "E1"));
+        CommandResult result = module.commandBus().dispatch(
+                new AuthorizeCommand("E3", "ACC-001", "Auth-A", 20_000L));
+        assertTrue(result.error().isEmpty());
+        Account account = module.account("ACC-001").orElseThrow();
+        assertEquals(AuthorizationStatus.APPROVED, account.authorizations().iterator().next().status());
+        assertEquals(0L, account.availableBalanceInMinorUnits());
     }
 }

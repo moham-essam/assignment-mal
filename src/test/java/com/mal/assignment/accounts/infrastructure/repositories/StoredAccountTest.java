@@ -17,11 +17,11 @@ class StoredAccountTest {
         Account original = new Account("ACC-001", Currency.AED, 0L);
         original.appendLedgerEntry(LedgerEntry.draft("E1", 1, 120_000L, LedgerEntryType.CREDIT, "E1"));
         original.appendAuthorization(new Authorization(
-                "E3", "Auth-A", 20_000L, AuthorizationStatus.APPROVED));
+                "E3", "Auth-A", 20_000L, AuthorizationStatus.APPROVED, 1));
         Account snapshot = StoredAccount.snapshotOf(original);
         original.appendLedgerEntry(LedgerEntry.draft("E2", 1, 5_000L, LedgerEntryType.CREDIT, "E2"));
         original.appendAuthorization(new Authorization(
-                "E8", "Auth-B", 1_000L, AuthorizationStatus.DECLINED));
+                "E8", "Auth-B", 1_000L, AuthorizationStatus.DECLINED, 1));
         assertEquals(1, snapshot.entries().size());
         assertEquals(1, snapshot.authorizations().size());
         assertEquals(120_000L, snapshot.amountInMinorUnits());

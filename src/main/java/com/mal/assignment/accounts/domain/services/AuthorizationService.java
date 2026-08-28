@@ -1,6 +1,8 @@
 package com.mal.assignment.accounts.domain.services;
 
+import com.mal.assignment.accounts.domain.buses.CommandBus;
 import com.mal.assignment.accounts.domain.commands.AuthorizeCommand;
+import com.mal.assignment.accounts.domain.commands.ReconcileFromDayCommand;
 import com.mal.assignment.accounts.domain.commands.SettleAuthorizationCommand;
 import com.mal.assignment.accounts.domain.models.Account;
 import com.mal.assignment.accounts.domain.models.Authorization;
@@ -18,6 +20,7 @@ import lombok.RequiredArgsConstructor;
 public final class AuthorizationService {
 
     private final UnitOfWorkFactory unitOfWorkFactory;
+    private final CommandBus commandBus;
 
     public long authorize(AuthorizeCommand command) {
         UnitOfWork unitOfWork = unitOfWorkFactory.begin();
@@ -30,7 +33,8 @@ public final class AuthorizationService {
                     command.commandId(),
                     command.authorizationReference(),
                     command.requestedAmountInMinorUnits(),
-                    AuthorizationStatus.DECLINED
+                    AuthorizationStatus.DECLINED,
+                    account.lastClosedDay() + 1
             ));
             unitOfWork.commit();
             throw exception;
@@ -40,7 +44,8 @@ public final class AuthorizationService {
                 command.commandId(),
                 command.authorizationReference(),
                 command.requestedAmountInMinorUnits(),
-                AuthorizationStatus.APPROVED
+                AuthorizationStatus.APPROVED,
+                account.lastClosedDay() + 1
         ));
 
         return unitOfWork.commit();
@@ -69,6 +74,17 @@ public final class AuthorizationService {
         ));
         account.releaseHold(authorization.requestedAmountInMinorUnits());
 
-        return unitOfWork.commit();
+        long version = unitOfWork.commit();
+        int lastClosedDay = account.lastClosedDay();
+        if (lastClosedDay >= command.valueDay()) {
+            commandBus.dispatch(new ReconcileFromDayCommand(
+                    command.commandId() + ":recon",
+                    command.accountId(),
+                    command.valueDay(),
+                    lastClosedDay
+            ));
+        }
+
+        return version;
     }
 }

@@ -4,7 +4,8 @@ public record Authorization(
         String idempotencyKey,
         String referenceId,
         long requestedAmountInMinorUnits,
-        AuthorizationStatus status
+        AuthorizationStatus status,
+        int heldFromDay
 ) {
 
     public boolean approved() {

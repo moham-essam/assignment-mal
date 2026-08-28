@@ -10,6 +10,7 @@ import com.mal.assignment.accounts.domain.models.LedgerDomainException;
 import com.mal.assignment.accounts.domain.models.LedgerEntry;
 import com.mal.assignment.accounts.domain.models.LedgerEntryType;
 import com.mal.assignment.accounts.domain.services.BookingService;
+import com.mal.assignment.accounts.infrastructure.buses.InMemoryCommandBus;
 import com.mal.assignment.accounts.infrastructure.repositories.InMemoryAccountRepository;
 import com.mal.assignment.support.StubUnitOfWork;
 import org.junit.jupiter.api.Test;
@@ -72,10 +73,18 @@ class InMemoryUnitOfWorkTest {
     void handlerUsesStubUnitOfWorkNotARepository() {
         Account account = new Account("ACC-001", Currency.AED, 0L);
         StubUnitOfWork stub = new StubUnitOfWork(account);
-        BookCreditCommandHandler handler = new BookCreditCommandHandler(new BookingService(stub));
+        BookCreditCommandHandler handler = new BookCreditCommandHandler(
+                new BookingService(stub, new InMemoryCommandBus()));
         CommandResult result = handler.handle(new BookCreditCommand("E1", "ACC-001", 1, 120_000L, "E1"));
         assertFalse(result.failed());
         assertEquals(1, stub.commitCount());
         assertEquals(120_000L, account.amountInMinorUnits());
+    }
+
+    @Test
+    void loadReturnsEmptyForUnknownAccount() {
+        InMemoryAccountRepository repository = new InMemoryAccountRepository();
+        InMemoryUnitOfWork unitOfWork = new InMemoryUnitOfWork(repository);
+        assertTrue(unitOfWork.load("MISSING").isEmpty());
     }
 }

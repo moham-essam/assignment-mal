@@ -101,6 +101,28 @@ public final class Account {
         return authorization;
     }
 
+    public long holdAmountInMinorUnits(int day) {
+        long hold = 0L;
+        for (Authorization authorization : authorizations.values()) {
+            if (!authorization.approved() || authorization.heldFromDay() > day) {
+                continue;
+            }
+            boolean released = false;
+            for (LedgerEntry entry : entries.values()) {
+                if (entry.type() == LedgerEntryType.SETTLEMENT
+                        && authorization.referenceId().equals(entry.referenceId())
+                        && entry.valueDay() <= day) {
+                    released = true;
+                    break;
+                }
+            }
+            if (!released) {
+                hold += authorization.requestedAmountInMinorUnits();
+            }
+        }
+        return hold;
+    }
+
     public void releaseHold(long holdInMinorUnits) {
         long nextHold = holdAmountInMinorUnits - holdInMinorUnits;
         if (nextHold < 0L) {
@@ -135,7 +157,16 @@ public final class Account {
     }
 
     public List<LedgerEntry> ledgerEntriesSortedByValueDay() {
-        List<LedgerEntry> ordered = new ArrayList<>(entries.values());
+        return ledgerEntriesSortedByValueDay(Integer.MIN_VALUE);
+    }
+
+    public List<LedgerEntry> ledgerEntriesSortedByValueDay(int fromDay) {
+        List<LedgerEntry> ordered = new ArrayList<>();
+        for (LedgerEntry entry : entries.values()) {
+            if (entry.valueDay() >= fromDay) {
+                ordered.add(entry);
+            }
+        }
         ordered.sort(Comparator.comparingInt(LedgerEntry::valueDay)
                 .thenComparing(LedgerEntry::idempotencyKey));
         return ordered;
@@ -169,12 +200,8 @@ public final class Account {
     }
 
     private long signedSumThrough(int day, boolean excludeOwnDayFees) {
-        List<LedgerEntry> ordered = ledgerEntriesSortedByValueDay();
-        if (ordered.isEmpty()) {
-            return openingBalanceInMinorUnits;
-        }
-        long running = ordered.getFirst().balanceBeforeInMinorUnits();
-        for (LedgerEntry entry : ordered) {
+        long running = openingBalanceInMinorUnits;
+        for (LedgerEntry entry : ledgerEntriesSortedByValueDay()) {
             if (entry.valueDay() > day) {
                 break;
             }

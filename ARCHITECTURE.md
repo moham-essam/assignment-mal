@@ -1,2018 +1,323 @@
-# [ARCHITECTURE.md](http://ARCHITECTURE.md)
+# ARCHITECTURE.md
+
+This file records every design decision for the in-memory banking ledger. Refused assignment criteria and abandoned approaches live only in [REJECTED.md](REJECTED.md). Open arithmetic questions live in [AMBIGUITIES.md](AMBIGUITIES.md).
+
+No database, web layer, UI, Spring, or Kafka. Java 21, Maven, JUnit 5, in-memory only.
+
+---
 
 ## 1. Overview
 
-The solution uses an event-sourced account model.
+The identity type is **`Account`**. It owns:
 
-The supplied E1–E10 records are treated internally as **commands** because they represent incoming requests that may still require validation or may be rejected.
+- identity: `id`, `currency`, `openingBalanceInMinorUnits` (these fields do not live on `AccountState`)
+- `ConcurrentHashMap<String, LedgerEntry>` keyed by **idempotency key** (`putIfAbsent`)
+- `ConcurrentHashMap<String, Authorization>` keyed by **idempotency key** (`putIfAbsent`)
+- `AtomicReference<AccountState>` for booked amount, holds, reversed refs, daily accruals, capitalized interest, version
 
-Successful or rejected decisions produce immutable **domain events**.
+Every command handler uses **`UnitOfWorkFactory` only**. None inject `AccountRepository`. `InMemoryUnitOfWork` is the only class that uses the repository.
 
-Those domain events are stored in an append-only event store and form the source of truth for the account.
-
-The main architectural flow is:
+There is no event store, no `DomainEvent`, no `EventBus`, and no `AccountState.apply(event)`.
 
 ```text
-External Command
-      |
-      v
-Account Aggregate
-validate / decide
-      |
-      v
-Domain Event(s)
-      |
-      v
-Event Store
-      |
-      +-------------------+
-      |                   |
-      v                   v
-Account Projection     Ledger Projection
-      |                   |
-      v                   v
-Fast operational       Monetary history
-reads
+Command
+  -> CommandBus
+  -> CommandHandler
+  -> UnitOfWork.begin / load or registerNew
+  -> Account.appendLedgerEntry or appendAuthorization
+  -> UnitOfWork.commit
 ```
 
-The implementation remains in-memory for the exercise, but the design preserves the same boundaries that could be used with a persistent event store.
-
-No database, web layer, UI, or persistence layer is introduced.
+Reverse is the only posting handler that, **after commit**, dispatches `ReconcileFromDayCommand`. The simulation engine wraps other backdated postings (E7, E10) with that same command.
 
 ---
 
+## 2. Why not event sourcing
 
-
-## 2. Why event sourcing was chosen
-
-I considered two main designs.
-
-The first was a traditional append-only monetary ledger combined with separately maintained authorization state.
-
-The second was event sourcing, where immutable domain events represent every accepted or rejected business decision and all current state is derived from those events.
-
-I chose event sourcing because several requirements naturally depend on reconstructing historical state.
-
-The specification includes:
+E7/E9, fees, and interest are closing-balance problems over `valueDay`.
 
 ```text
-ordered input
-append-only history
-no mutation or deletion
-reversals
-backdated value dates
-authorization holds
-settlements
-historical fee reconciliation
+closing(day) = opening + sum(signed amounts where valueDay <= day)
 ```
 
-The most important reason is the interaction between backdated events and historical state.
+The entry map is unordered. Reconciliation loads entries **sorted by `valueDay` ASC, then `sequence` ASC** and computes a **local** running total. Existing ledger rows are never mutated.
 
-For example, E7 arrives on Day 5 but has:
+`putIfAbsent` is the uniqueness check. `UnitOfWork.commit` is the only persistence call a handler makes.
 
-```text
-value_date = Day 2
-```
-
-Later, E9 reverses E7 with the same historical value date.
-
-That can require recalculating the account from Day 2 forward, including previously assessed overdraft fees and potentially interest accruals.
-
-If the system only stored today's balance and today's authorization state, it would lose information needed to reconstruct what happened historically.
-
-With event sourcing, the system retains facts such as:
-
-```text
-CreditBooked
-DebitBooked
-AuthorizationApproved
-AuthorizationDeclined
-SettlementBooked
-SettlementRejected
-TransactionReversed
-OverdraftFeeAssessed
-OverdraftFeeReversed
-DailyInterestAccrued
-InterestCapitalized
-```
-
-The current account state can always be reconstructed by replaying those events.
-
-This gives three important properties.
-
-### Auditability
-
-The original history is never destroyed.
-
-A reversal does not delete the original debit.
-
-A fee reversal does not delete the original fee.
-
-### Historical reconstruction
-
-The account can be reconstructed at an earlier point in the event stream.
-
-### Deterministic replay
-
-Given the same ordered domain events, the same account state and projections should be produced.
+A traditional event-sourced `AccountState.apply(event)` plus event store was considered and **rejected**. See [REJECTED.md](REJECTED.md).
 
 ---
 
+## 3. Decision log
 
+These are the decisions. Each one is in force unless [REJECTED.md](REJECTED.md) records the opposite as abandoned.
 
-## 3. Trade-off of event sourcing
+### Identity and state
 
-Event sourcing has a cost.
+1. **`Account` is the aggregate.** `id`, `currency`, and `openingBalanceInMinorUnits` live only on `Account`.
+2. **`AccountState` is immutable scalars** behind `AtomicReference`: `amountInMinorUnits`, `holdAmountInMinorUnits`, `reversedReferenceIds`, `accruedDailyInterestByDay`, `capitalizedInterestInMinorUnits`, `version`.
+3. **`AccountState` does not hold** id, currency, opening, entries, authorizations, errors, or processed command keys.
+4. **Ledger entries and authorizations live on `Account`**, in `ConcurrentHashMap`s keyed by idempotency key.
+5. **Idempotency is `putIfAbsent`.** A second append with the same key returns the existing row and does not change amount.
 
-The main one is read amplification.
+### Ledger rows
 
-If an account has hundreds of thousands of events, rebuilding its current state from event 1 for every authorization request would be inefficient.
+6. **Every `LedgerEntry` has `balanceBeforeInMinorUnits` and `balanceAfterInMinorUnits`.** Both are required fields on the committed row.
+7. **`appendLedgerEntry` stamps those fields at append time** from the CAS'd `AccountState.amountInMinorUnits` (posting-order running total), `putIfAbsent`s the complete row, CASes amount to `balanceAfter`, then the handler `commit`s. The fields are not filled later as a report-only step.
+8. **`balanceBefore` / `balanceAfter` are write-once.** Recon does not `replace`, `withBalances`, or otherwise update existing rows.
+9. **Same-day order** uses a monotonic `sequence` assigned on append (not hash iteration).
+10. **A reversal keeps the original `valueDay`.** Compensating `REVERSAL` is a new row; the original debit stays.
 
-For that reason, the production-oriented design includes a derived:
+### Persistence and handlers
 
-```text
-AccountSnapshot
-```
+11. **Handlers take `UnitOfWorkFactory` only.** They never receive `AccountRepository`.
+12. **`UnitOfWork`:** `begin`, `load`, `registerNew`, `commit`. `InMemoryUnitOfWork` is the only repository client.
+13. **`InMemoryAccountRepository`** is `ConcurrentHashMap<String, Account>`.
+14. **Write path in the engine is only `CommandBus.dispatch`.** The engine does not inject `AccountRepository`. End-of-day batch account ids come from **config**.
+15. **One handler per command.** Credit and debit are two commands (`BookCreditCommand`, `BookDebitCommand`), not one combined booking command.
+16. **No `EventBus`.** Command diagrams do not include `AccountRepository` or `SimulationEngine`. Reverse is the only posting diagram that includes reconcile.
 
-The event store remains the source of truth.
+### Available balance
 
-The snapshot exists only to make current-state reads fast.
+17. **Available = `amountInMinorUnits - holdAmountInMinorUnits`** (all holds).
+18. **Debit and authorize must call `ensureSufficientAvailable`** before append. Insufficient debit: no ledger row, no commit, `CommandResult` with `INSUFFICIENT_AVAILABLE_BALANCE`.
+19. **Credit does not check available.**
+20. **Authorize decline** still `appendAuthorization(DECLINED)` and `commit` so no hold is applied.
+21. **Authorize fail-closed** on commit conflict: `CONCURRENT_MODIFICATION`.
 
-Conceptually:
+### Reverse and reconcile
 
-```text
-Event Store
-    |
-    | replay/update
-    v
-AccountSnapshot
-```
+22. **`ReverseTransactionCommand` only books `REVERSAL`.** It does not inline fee rows or accrual rewrites.
+23. **After reverse `commit`, the handler dispatches `ReconcileFromDayCommand`** from the original `valueDay` through last closed day (max key in `accruedDailyInterestByDay`). Two commits; one reverse from the caller's point of view.
+24. **If nothing is closed yet** (`lastClosedDay < valueDay`), skip recon; the next `EndOfDayCommand` assesses that day.
+25. **Credit, debit, instalments, authorize, and settle do not dispatch recon.** The engine wrap does, for backdated postings that those handlers do not cover (E7, E10).
+26. **The engine does not dispatch a second recon after E9.** Reverse already ran it.
+27. **`ReconcileFromDayCommand` is its own command.** Called from reverse and from the engine wrap. Idempotent. One commit.
+28. **Recon load order:** all entries sorted `valueDay` ASC, then `sequence` ASC.
+29. **Recon `running` starts at the first sorted entry's `balanceBeforeInMinorUnits`**, then adds each signed amount in local variables. It does not seed from opening.
+30. **Recon may append new `OVERDRAFT_FEE` / `FEE_REVERSAL` rows** through `appendLedgerEntry` (those new rows get before/after at append). It does not update old rows.
+31. **A day's own fee is excluded** from that day's negativity test (postings-only closing).
+32. **Following days are in scope.** A reversal or backdated posting can change every later closing; recon walks `fromDay` through `toDay` inclusive.
 
-The snapshot contains the information required for common operational decisions such as authorization.
+### End of day, interest, fees
 
-It can always be rebuilt from the event stream if necessary.
+33. **`EndOfDayCommand` always writes `accruedDailyInterestByDay[day]`.** Positive closing: `InterestPolicy` at 4/10000, rounding **DOWN**. Zero or negative closing: accrue `0`.
+34. **Negative postings-only closing also appends `OVERDRAFT_FEE`.** Accrual is not a ledger row.
+35. **Capitalization (day 6) is one `INTEREST_CAPITALIZATION` credit** equal to the **sum of the accrual map**. There is no independently calculated remainder to discard.
+36. **Capitalization is excluded from daily closings until report day >= 6.**
+37. **Overdraft fees** are config integers in minor units: AED `2500`, BHD `25000` (BHD fee is invented; see [AMBIGUITIES.md](AMBIGUITIES.md)).
 
-For this six-day exercise the stream is tiny, so replay cost is not a practical problem, but the projection makes the architectural trade-off explicit.
+### Money, config, errors, reports
 
----
+38. **All money is `long` minor units.** AED scale 2, BHD scale 3. No `BigDecimal`, `float`, or `double` for booked amounts.
+39. **All ledger constants live in `application.yaml`.** Fees, rates, opening balances, window days, rounding mode.
+40. **E10 splits BHD 10.000 as `3334 / 3333 / 3333`** minor units (exact total preserved).
+41. **Errors live on `CommandResult` / `SimulationResult`**, not on `AccountState`. Runtime declines (E6, E8, insufficient debit) are **not** appended to `REJECTED.md` when the simulation runs.
+42. **Refused assignment criteria and abandoned designs live only in `REJECTED.md`.** They are not stored on `AccountState` and are not mixed into the verified arithmetic as alternate goldens.
+43. **`ReportBuilder` reads `Account` plus `SimulationResult` errors.**
+44. **Package root is `com.mal.assignment`.** Hexagonal layout: domain ports (`repositories`, `unitofwork`, `buses`) and infrastructure adapters.
 
+### Process
 
-
-## 4. Commands versus events
-
-Although the exercise refers to E1–E10 as an event stream, I model them internally as **commands**.
-
-The reason is that some of them still require business validation.
-
-For example:
-
-```text
-SETTLEMENT Auth-Z AED 180
-```
-
-cannot automatically be considered an accepted financial fact.
-
-The system must first determine whether Auth-Z exists.
-
-Therefore the incoming object is conceptually a command such as:
-
-```text
-SettleAuthorizationCommand
-```
-
-The aggregate evaluates the command and may produce:
-
-```text
-SettlementBooked
-```
-
-or:
-
-```text
-SettlementRejected
-```
-
-This distinction keeps the authoritative event store limited to facts that the system has actually decided occurred.
-
-A command describes something the outside world is asking the system to do.
-
-A domain event describes something the system has decided actually happened.
+45. **Review gate after every implementation task.** Tests + lints, then wait for approval before commit.
+46. **Intentionally failing test:** backdated posting after Day 6 capitalization, tagged `known-limitation`.
 
 ---
 
+## 4. What lives where
 
-
-## 5. Command processing flow
-
-The general command flow is:
-
-```text
-1. Receive command.
-2. Load current account state.
-3. Validate business rules.
-4. Produce domain event(s).
-5. Append events using optimistic concurrency.
-6. Apply events to the account projection.
-7. Update derived projections such as the monetary ledger.
-```
-
-For example:
-
-```text
-AuthorizeCommand(Auth-A, AED 200)
-
-        |
-        v
-
-Check available balance
-
-        |
-        v
-
-AuthorizationApproved(Auth-A, AED 200)
-```
-
-or:
-
-```text
-AuthorizationDeclined(Auth-A, reason)
-```
-
----
-
-
-
-## 6. Event store as the source of truth
-
-The event store contains immutable domain events.
-
-No domain event is mutated or deleted.
-
-Conceptually, each stored event contains:
+### Account
 
 ```java
-public record StoredEvent(
-    String eventId,
-    String accountId,
-    long version,
-    DomainEvent event
-) {}
-```
-
-The important ordering is:
-
-```text
-accountId + version
-```
-
-Each account has its own monotonically increasing stream version.
-
-For example:
-
-```text
-ACC-001 / version 1
-ACC-001 / version 2
-ACC-001 / version 3
-
-ACC-002 / version 1
-ACC-002 / version 2
-```
-
----
-
-
-
-## 7. Why account stream version exists
-
-The account stream version provides both ordering and optimistic concurrency.
-
-Suppose two authorization requests both read:
-
-```text
-ACC-001
-version = 10
-```
-
-Both decide they can reserve AED 80.
-
-The first request appends:
-
-```text
-ACC-001 / version 11
-```
-
-successfully.
-
-The second request also tries to append version 11.
-
-That append must fail because version 11 already exists.
-
-The second authorization must then reload the latest account state and reevaluate its decision.
-
-This prevents two requests from being accepted using the same stale account state.
-
----
-
-
-
-## 8. Event store uniqueness constraint
-
-A persistent implementation would enforce:
-
-```text
-UNIQUE(account_id, version)
-```
-
-This is the core optimistic concurrency guarantee.
-
-A globally unique event identifier would also normally be enforced:
-
-```text
-UNIQUE(event_id)
-```
-
-Conceptually:
-
-```text
-event_id
-account_id
-version
-event_type
-payload
-value_date
-occurred_at
-
-UNIQUE(event_id)
-UNIQUE(account_id, version)
-```
-
-For this exercise the event store is in-memory, but it follows the same logical rule.
-
----
-
-
-
-## 9. Account
-
-The account contains stable information:
-
-```java
-public record Account(
-    String accountId,
-    Currency currency,
-    long openingBalanceInMinorUnits
-) {}
-```
-
-The supplied accounts are:
-
-```text
-ACC-001 — AED
-ACC-002 — BHD
-```
-
-These identifiers are used directly.
-
-No additional account identifier is introduced.
-
----
-
-
-
-## 10. Currency
-
-The supported currency precision is defined by the specification:
-
-```text
-AED = 2 decimal places
-BHD = 3 decimal places
-```
-
-Conceptually:
-
-```java
-public enum Currency {
-    AED(2),
-    BHD(3);
-
-    private final int scale;
-
-    Currency(int scale) {
-        this.scale = scale;
+public LedgerEntry appendLedgerEntry(LedgerEntry draft) {
+    long before = current().amountInMinorUnits();
+    long after = before + draft.signedAmountInMinorUnits();
+    LedgerEntry row = draft.withBalances(before, after);
+    LedgerEntry existing = entries.putIfAbsent(row.idempotencyKey(), row);
+    if (existing != null) {
+        return existing;
     }
+    casAmountTo(after);
+    return row;
+}
 
-    public int scale() {
-        return scale;
+public void ensureSufficientAvailable(long requestedInMinorUnits) {
+    if (current().availableBalanceInMinorUnits() < requestedInMinorUnits) {
+        throw new InsufficientAvailableBalanceException(id, requestedInMinorUnits);
     }
 }
 ```
 
----
+`availableBalanceInMinorUnits()` = `amountInMinorUnits - holdAmountInMinorUnits`.
 
-
-
-## 11. Monetary representation
-
-Monetary amounts are stored as integer minor units using `long`.
-
-I deliberately do not use `float` or `double`.
-
-Examples:
-
-```text
-AED 1,200.00 -> 120000
-AED   950.00 ->  95000
-AED    25.00 ->   2500
-
-BHD    10.000 -> 10000
-BHD     3.334 ->  3334
-```
-
-This is a fixed-point representation.
-
-The decimal position is determined by the currency.
-
----
-
-
-
-## 12. Meaning of minor units
-
-The word `minor` refers to the smallest supported monetary unit.
-
-For AED:
-
-```text
-1 AED = 100 fils
-```
-
-Therefore:
-
-```text
-AED 12.34
-=
-1234 minor units
-```
-
-For BHD:
-
-```text
-1 BHD = 1000 fils
-```
-
-Therefore:
-
-```text
-BHD 10.000
-=
-10000 minor units
-```
-
-Fields are deliberately named explicitly:
+### Unit of work
 
 ```java
-amountInMinorUnits
-openingBalanceInMinorUnits
-activeHoldInMinorUnits
+interface UnitOfWorkFactory {
+    UnitOfWork begin();
+}
+
+interface UnitOfWork {
+    Optional<Account> load(String accountId);
+    void registerNew(Account account);
+    CommitResult commit();
+}
 ```
 
-rather than simply:
+Handler shape (all commands):
+
+```text
+uow = factory.begin()
+account = uow.load(id)   // or registerNew for open
+account.ensureSufficientAvailable(amount)  // debit and authorize only
+account.appendLedgerEntry(...)             // stamps balanceBefore / balanceAfter
+uow.commit()
+// reverse only: commandBus.dispatch(ReconcileFromDayCommand from valueDay through lastClosedDay)
+```
+
+---
+
+## 5. Packages
+
+```text
+com.mal.assignment
+├── accounts
+│   ├── domain
+│   │   ├── models             Account, AccountState, Authorization,
+│   │   │                      LedgerEntry, LedgerEntryType, Currency, MinorUnits,
+│   │   │                      FailureReason, LedgerError
+│   │   ├── commands           sealed Command hierarchy
+│   │   ├── commandhandlers    one handler per command; UnitOfWorkFactory only
+│   │   ├── repositories       PORT: AccountRepository (UnitOfWork adapter only)
+│   │   ├── unitofwork         PORT: UnitOfWork, UnitOfWorkFactory, CommitResult
+│   │   ├── buses              PORT: CommandBus (no EventBus)
+│   │   ├── services           OverdraftPolicy, InterestPolicy, ReconciliationTrigger, LedgerPolicies
+│   │   └── reports            DailySnapshot, DailyReport, ScenarioReport, ReportBuilder
+│   └── infrastructure
+│       ├── repositories       InMemoryAccountRepository
+│       ├── unitofwork         InMemoryUnitOfWork, InMemoryUnitOfWorkFactory
+│       ├── buses              InMemoryCommandBus
+│       ├── config             LedgerConfig + YamlLedgerConfigLoader
+│       └── reports            ReportPrinter
+├── simulation                 SimulationEngine, ScenarioFixture, Checkpoint, SimulationResult
+└── ReplayMain
+```
+
+`AccountsModule` wires `InMemoryUnitOfWorkFactory(accountRepository)` into every handler.
+
+---
+
+## 6. Commands
+
+| Command | Behaviour |
+|---|---|
+| `OpenAccountCommand` | `registerNew` + `commit`. Adapter `putIfAbsent` inside the unit of work. |
+| `BookCreditCommand` | Append `CREDIT`. No available check. |
+| `BookDebitCommand` | `ensureSufficientAvailable` then append `DEBIT`. E2 and E7. |
+| `CreditInstalmentsCommand` | E10: three rows `E10:1/2/3`, one commit. |
+| `AuthorizeCommand` | `ensureSufficientAvailable` then `APPROVED`; else `DECLINED` + commit. No ledger row. |
+| `SettleAuthorizationCommand` | `SETTLEMENT` + full hold release. Unknown auth (E6) → `CommandResult` error. |
+| `ReverseTransactionCommand` | `REVERSAL` same `valueDay`, commit, dispatch `ReconcileFromDayCommand`. |
+| `EndOfDayCommand` | Fee if negative; always `accrueInterestForDay`. One commit. |
+| `ReconcileFromDayCommand` | Sorted value-date walk; append fee/fee reversal if needed; overwrite accruals. |
+| `CapitalizeInterestCommand` | `INTEREST_CAPITALIZATION` = sum of accrual map. |
+| `EndOfDayBatchCommand` | Engine loops config account ids and dispatches `EndOfDayCommand`. |
+
+### Reverse then reconcile
+
+```mermaid
+sequenceDiagram
+    participant CommandBus
+    participant ReverseTransactionCommandHandler
+    participant UnitOfWork
+    participant Account
+    participant ReconcileFromDayCommandHandler
+
+    CommandBus->>ReverseTransactionCommandHandler: handle(ReverseTransactionCommand)
+    ReverseTransactionCommandHandler->>UnitOfWork: begin
+    ReverseTransactionCommandHandler->>UnitOfWork: load(accountId)
+    ReverseTransactionCommandHandler->>Account: entryByReference originalReference
+    ReverseTransactionCommandHandler->>Account: appendLedgerEntry REVERSAL same valueDay
+    ReverseTransactionCommandHandler->>UnitOfWork: commit
+    ReverseTransactionCommandHandler->>CommandBus: dispatch ReconcileFromDayCommand
+    CommandBus->>ReconcileFromDayCommandHandler: handle(ReconcileFromDayCommand)
+```
+
+### Reconcile load (no update of existing rows)
 
 ```java
-amount
-```
-
-because the integer alone does not communicate its scale.
-
-For example:
-
-```text
-1234 minor units
-```
-
-means:
-
-```text
-AED 12.34
-```
-
-for AED, but:
-
-```text
-BHD 1.234
-```
-
-for BHD.
-
----
-
-
-
-## 13. Why fixed-point integers
-
-Booked monetary addition and subtraction become exact integer operations.
-
-For example:
-
-```text
-120000 - 95000
-=
-25000
-=
-AED 250.00
-```
-
-There is no binary floating-point rounding error.
-
-This also makes monetary conservation easier to verify.
-
-For E10:
-
-```text
-BHD 10.000
-=
-10000 minor units
-```
-
-Any division residual is explicit rather than hidden in decimal representation.
-
-Fractional calculations such as interest still require explicit division and rounding, but once an amount becomes a booked monetary value it is represented exactly in minor units.
-
----
-
-
-
-## 14. Domain events
-
-Domain events represent facts accepted by the account aggregate.
-
-Examples include:
-
-```text
-CreditBooked
-DebitBooked
-
-AuthorizationApproved
-AuthorizationDeclined
-
-SettlementBooked
-SettlementRejected
-
-TransactionReversed
-
-OverdraftFeeAssessed
-OverdraftFeeReversed
-
-DailyInterestAccrued
-InterestCapitalized
-```
-
-These events are immutable.
-
-They are the authoritative account history.
-
----
-
-
-
-## 15. AccountSnapshot
-
-The account snapshot is a projection of the event stream.
-
-It exists to make current account operations efficient.
-
-Conceptually:
-
-```java
-public record AccountSnapshot(
-    String accountId,
-    long ledgerBalanceInMinorUnits,
-    long activeHoldInMinorUnits,
-    Map<String, Authorization> authorizations,
-    long streamVersion
-) {}
-```
-
-The snapshot is not the source of truth.
-
-It represents:
-
-```text
-the result of applying domain events
-through streamVersion
-```
-
-If the snapshot is lost or corrupted, it can be rebuilt by replaying events.
-
----
-
-
-
-## 16. Why the snapshot contains streamVersion
-
-The projection must identify exactly which events it represents.
-
-For example:
-
-```text
-AccountSnapshot
-streamVersion = 20
-```
-
-means:
-
-```text
-events 1 through 20 have been applied
-```
-
-If the event store has already reached:
-
-```text
-version 22
-```
-
-the snapshot is stale.
-
-Before making a critical decision, the projection must either:
-
-```text
-apply events 21 and 22
-```
-
-or rebuild from the event stream.
-
----
-
-
-
-## 17. Available balance
-
-The authorization rule uses:
-
-```text
-available balance
-=
-ledger balance
--
-active holds
-```
-
-For example:
-
-```text
-ledger balance = AED 250
-active holds   = AED 200
-available      = AED  50
-```
-
-The snapshot provides both values required for a fast calculation.
-
----
-
-
-
-## 18. Authorization processing
-
-An authorization command is evaluated against the latest account state.
-
-Conceptually:
-
-```text
-1. Load AccountSnapshot at version N.
-2. Ensure it is current.
-3. Calculate available balance.
-4. Apply requested hold.
-5. Produce AuthorizationApproved or AuthorizationDeclined.
-6. Append event using expected stream version N.
-```
-
-For E3:
-
-```text
-ledger balance = AED 250
-active holds   = AED   0
-requested      = AED 200
-```
-
-Therefore:
-
-```text
-available after hold
-=
-250 - 200
-=
-AED 50
-```
-
-Auth-A is approved.
-
----
-
-
-
-## 19. Concurrent authorization example
-
-Assume:
-
-```text
-ledger balance = AED 100
-active holds   = AED   0
-stream version = 10
-```
-
-Two requests arrive:
-
-```text
-Auth-X = AED 80
-Auth-Y = AED 80
-```
-
-Both initially read version 10.
-
-Request X appends:
-
-```text
-AuthorizationApproved(Auth-X)
-version 11
-```
-
-Request Y attempts to append another version 11 event.
-
-The event store rejects it because:
-
-```text
-(accountId, version)
-```
-
-must be unique.
-
-Request Y reloads the account.
-
-The updated state now has:
-
-```text
-active hold = AED 80
-available   = AED 20
-```
-
-so Auth-Y is declined.
-
-This prevents overspending without requiring a global lock.
-
----
-
-
-
-## 20. Authorization state
-
-Authorization information is derived from events.
-
-Conceptually:
-
-```java
-public record Authorization(
-    String authorizationId,
-    long amountInMinorUnits,
-    AuthorizationStatus status
-) {}
-```
-
-Possible statuses include:
-
-```java
-APPROVED
-DECLINED
-SETTLED
-```
-
-When:
-
-```text
-AuthorizationApproved(Auth-A, 200)
-```
-
-is applied:
-
-```text
-activeHold += 200
-Auth-A = APPROVED
-```
-
-When the settlement event is applied:
-
-```text
-activeHold -= 200
-Auth-A = SETTLED
+List<LedgerEntry> ordered = account.ledgerEntriesSortedByValueDay();
+if (ordered.isEmpty()) {
+    return;
+}
+long running = ordered.getFirst().balanceBeforeInMinorUnits();
+for (LedgerEntry entry : ordered) {
+    running += entry.signedAmountInMinorUnits();
+}
+// fromDay..toDay: append fee or fee reversal if needed; accrueInterestForDay
 ```
 
 ---
 
+## 7. Simulation engine wrap
 
+Engine only `CommandBus.dispatch`. Catch-up EOD, then the posting command, then `ReconcileFromDayCommand` if a closed day was affected **and the posting handler did not already run recon**.
 
-## 21. Monetary ledger projection
-
-The monetary ledger is a projection of domain events that actually move booked money.
-
-It contains entries such as:
+Schedule:
 
 ```text
-CREDIT
-DEBIT
-SETTLEMENT
-REVERSAL
-OVERDRAFT_FEE
-FEE_REVERSAL
-INTEREST_CAPITALIZATION
-```
-
-Authorization events do not create monetary ledger entries because holds do not affect ledger balance.
-
----
-
-
-
-## 22. Ledger entry
-
-Conceptually:
-
-```java
-public record LedgerEntry(
-    String entryId,
-    String accountId,
-    int valueDay,
-    long signedAmountInMinorUnits,
-    LedgerEntryType type,
-    String sourceEventId,
-    String referenceId
-) {}
-```
-
-Positive values increase ledger balance.
-
-Negative values decrease ledger balance.
-
-Examples:
-
-```text
-CreditBooked              +120000
-DebitBooked                -95000
-SettlementBooked           -18500
-TransactionReversed        +62000
-OverdraftFeeAssessed        -2500
-OverdraftFeeReversed        +2500
-InterestCapitalized            +...
+E1, E2, EOD-D1, E3, EOD-D2, E4, EOD-D3, E5, E6, EOD-D4,
+E7, RECON(ACC-001, D2..D4),
+E8, EOD-D5,
+E9 (reverse runs RECON D2..D5 internally),
+E10(late), RECON(ACC-002, D5..D5),
+EOD-D6, CAPITALIZE
 ```
 
 ---
 
-
-
-## 23. Processing order versus value date
-
-Domain-event order and financial value date are different concepts.
-
-Event stream order tells us:
-
-```text
-when the system accepted the fact
-```
-
-`value_date` tells us:
-
-```text
-which financial day the posting belongs to
-```
-
-E7 demonstrates the distinction:
-
-```text
-received Day 5
-value_date Day 2
-```
-
-The event remains later in the stream but contributes to Day 2 ledger balance.
-
-The event store must never be sorted by value date.
-
----
-
-
-
-## 24. Ledger balance calculation
-
-Ledger balance for account A on day D is:
-
-```text
-opening balance
-+
-all monetary ledger entries
-whose value_date <= D
-```
-
-Conceptually:
-
-```text
-ledgerBalance(account, day)
-=
-openingBalance
-+
-Σ(entries where valueDate <= day)
-```
-
-This supports backdated transactions naturally.
-
----
-
-
-
-## 25. Backdated debit E7
-
-Before E7:
-
-```text
-E1 +AED 1,200
-E2 -AED   950
---------------
-     AED   250
-```
-
-E7 later arrives:
-
-```text
--AED 620
-value_date Day 2
-```
-
-Day 2 becomes:
-
-```text
-250 - 620
-=
-AED -370
-```
-
-even though the debit was received on Day 5.
-
-Because later daily balances include earlier value-dated postings, Day 3, Day 4, and later balances may also change.
-
----
-
-
-
-## 26. Settlement
-
-E5 settles Auth-A for:
-
-```text
-AED 185
-```
-
-Auth-A originally reserved:
-
-```text
-AED 200
-```
-
-The aggregate verifies that Auth-A exists and is approved.
-
-It then emits a settlement event.
-
-Applying that event:
-
-```text
-books -AED 185
-marks Auth-A SETTLED
-releases the full AED 200 hold
-```
-
-The unused AED 15 is no longer reserved.
-
----
-
-
-
-## 27. Unknown settlement
-
-E6 references:
-
-```text
-Auth-Z
-```
-
-No valid authorization exists.
-
-Therefore the command does not emit a monetary settlement event.
-
-Instead it produces a rejection/error event such as:
-
-```text
-SettlementRejected(
-    authorizationId = Auth-Z,
-    reason = UNKNOWN_AUTHORIZATION
-)
-```
-
-No funds leave the account.
-
----
-
-
-
-## 28. Reversal
-
-E9 reverses E7.
-
-The original event is never removed.
-
-Instead the aggregate emits:
-
-```text
-TransactionReversed
-```
-
-which creates the opposite ledger effect:
-
-```text
-E7  -AED 620
-E9  +AED 620
-```
-
-The audit history therefore contains both the original transaction and its reversal.
-
----
-
-
-
-## 29. End-of-day processing
-
-Daily overdraft assessment and daily interest accrual are triggered through explicit commands rather than being embedded inside individual transaction handlers.
-
-In a production system, a scheduler or cron job could trigger:
-
-```text
-EndOfDayBatchCommand(day)
-```
-
-The batch process then iterates over all accounts and sends:
-
-```text
-EndOfDayCommand(accountId, day)
-```
-
-for each one.
-
-Conceptually:
-
-```text
-Scheduler
-    |
-    v
-EndOfDayBatchCommand(day)
-    |
-    +----> EndOfDayCommand(ACC-001, day)
-    |
-    +----> EndOfDayCommand(ACC-002, day)
-    |
-    +----> ...
-```
-
-The batch command itself is orchestration.
-
-Each account independently decides what domain events, if any, should be emitted.
-
----
-
-
-
-## 30. EndOfDayCommand
-
-Conceptually:
-
-```java
-public record EndOfDayCommand(
-    String accountId,
-    int day
-) {}
-```
-
-The account aggregate evaluates:
-
-```text
-closing ledger balance
-existing overdraft-fee state
-daily interest eligibility
-```
-
-The command itself does not automatically create a domain event.
-
-A command asks the domain to evaluate a condition.
-
-An event represents a fact that resulted from that evaluation.
-
-For example:
-
-```text
-EndOfDayCommand(ACC-001, Day 2)
-
-        |
-        v
-
-calculate closing ledger balance
-
-        |
-        +---- negative
-        |       |
-        |       v
-        | OverdraftFeeAssessed
-        |
-        +---- positive
-                |
-                v
-          DailyInterestAccrued
-```
-
-If the closing balance is zero, neither a fee nor interest needs to be emitted.
-
----
-
-
-
-## 31. Overdraft fee
-
-The overdraft fee is:
-
-```text
-AED 25.00
-```
-
-or:
-
-```text
-2500 minor units
-```
-
-A fee is required once per account/day when that day's closing ledger balance is negative.
-
-A fee assessment produces:
-
-```text
-OverdraftFeeAssessed
-```
-
-with:
-
-```text
-value_date = assessed day
-```
-
-The corresponding monetary projection becomes:
-
-```text
--AED 25
+## 8. Config
+
+```yaml
+ledger:
+  window-days: 6
+  rounding-mode: DOWN
+  currencies:
+    AED: { scale: 2 }
+    BHD: { scale: 3 }
+  interest:
+    daily-rate-numerator: 4
+    daily-rate-denominator: 10000
+    capitalization-day: 6
+  overdraft:
+    fees-in-minor-units:
+      AED: 2500
+      BHD: 25000
+  accounts:
+    - id: ACC-001
+      currency: AED
+      opening-balance-in-minor-units: 0
+    - id: ACC-002
+      currency: BHD
+      opening-balance-in-minor-units: 0
 ```
 
 ---
 
+## 9. Verified arithmetic (reference)
 
+All figures in minor units. Unchanged by the storage model.
 
-## 32. End-of-day overdraft assessment
+If E7 is booked: ACC-001 D1–D6 closings `25000, 25000, 65000, 46500, 46500, 46600` (report `250.00 … 466.00`). ACC-002 D5 `10000`, D6 `10008`. Capitalized: ACC-001 `100`, ACC-002 `8`. E7 causes **three** fees (D2, D4, D5). E8 Auth-B **declined**.
 
-For every account, `EndOfDayCommand` calculates the closing ledger balance using:
-
-```text
-opening balance
-+
-all booked monetary effects
-with value_date <= evaluated day
-```
-
-If:
-
-```text
-closing balance < 0
-```
-
-and there is no effective fee already present for that account/day, the aggregate emits:
-
-```text
-OverdraftFeeAssessed
-```
-
-The event is appended to the same account stream using optimistic concurrency.
+The debit-available check vs booking E7 into overdraft is recorded only in [REJECTED.md](REJECTED.md). Original goldens from E7 onward that assume E7 booked are not shipped as passing tests if that check is enforced.
 
 ---
 
-
-
-## 33. Historical fee calculation
-
-Backdated postings require historical fee reevaluation.
-
-Suppose E7 makes Day 2:
-
-```text
-AED -370
-```
-
-A Day 2 overdraft fee is then applied:
-
-```text
-AED -25
-```
-
-making Day 2:
-
-```text
-AED -395
-```
-
-That fee also affects later balances.
-
-For example:
-
-```text
-Day 3:
--395 + 400
-=
-AED 5
-```
-
-Then the Day 4 settlement:
-
-```text
-5 - 185
-=
-AED -180
-```
-
-can create another overdraft condition.
-
-Historical fee calculation is therefore performed chronologically from the affected value date forward.
-
----
-
-
-
-## 34. Fee reconciliation after a backdated reversal
-
-E9 can remove the condition that caused previous overdraft fees.
-
-Because the event store contains the full history, the system can reconstruct the affected historical account path.
-
-The reconciliation process is:
-
-```text
-1. Append TransactionReversed.
-2. Recalculate historical closing balances from the reversal value date.
-3. Recompute which overdraft fees should exist.
-4. Compare expected fee state with previously emitted fee events.
-5. Emit OverdraftFeeReversed for fees no longer justified.
-6. Emit new OverdraftFeeAssessed events for newly justified days.
-7. Continue until the historical fee state stabilizes.
-```
-
-No existing event is removed.
-
----
-
-
-
-## 35. Fee reversal
-
-Suppose the stream contains:
-
-```text
-DebitBooked             -620
-OverdraftFeeAssessed     -25
-```
-
-and the debit is later reversed.
-
-If the recomputed historical balance shows the fee is no longer required, the system emits:
-
-```text
-OverdraftFeeReversed     +25
-```
-
-The event history becomes:
-
-```text
-DebitBooked             -620
-OverdraftFeeAssessed     -25
-TransactionReversed     +620
-OverdraftFeeReversed     +25
-```
-
-This preserves both immutable history and the corrected economic outcome.
-
----
-
-
-
-## 36. Why full event history matters during reconciliation
-
-Fee reconciliation is one reason the event-sourced model is useful.
-
-Historical reconstruction can require more than today's ledger balance.
-
-The system may need to know:
-
-```text
-which debits existed
-which reversals existed
-which settlements existed
-which authorizations were approved
-which holds were active
-which fee events had already been emitted
-```
-
-The event stream preserves all of these facts.
-
-A mutable current account object alone would not.
-
----
-
-
-
-## 37. Daily interest accrual
-
-The same end-of-day evaluation determines whether the account earns interest.
-
-Daily interest is:
-
-```text
-0.04%
-```
-
-which equals:
-
-```text
-4 / 10000
-```
-
-Interest applies only when:
-
-```text
-closing ledger balance > 0
-```
-
-With integer minor units:
-
-```text
-interest
-=
-balanceInMinorUnits * 4 / 10000
-```
-
-with explicit rounding when the result does not equal a complete minor unit.
-
-If the rounded daily interest is positive, the aggregate emits:
-
-```text
-DailyInterestAccrued
-```
-
-This event records the rounded accrual but does not yet change ledger balance.
-
----
-
-
-
-## 38. Daily interest example
-
-For:
-
-```text
-AED 250.00
-```
-
-the balance is:
-
-```text
-25000 minor units
-```
-
-Interest:
-
-```text
-25000 * 4 / 10000
-=
-10 minor units
-```
-
-Therefore:
-
-```text
-AED 0.10
-```
-
-is accrued for that day.
-
-Each day's accrual is independently rounded to the currency precision.
-
----
-
-
-
-## 39. Interest capitalization on Day 6
-
-After the final Day 6 accrual has been calculated, the system issues:
-
-```text
-CapitalizeInterestCommand(accountId)
-```
-
-The aggregate obtains the effective daily interest accruals for Days 1 through 6 and calculates:
-
-```text
-capitalized total
-=
-sum of rounded daily accruals
-```
-
-It then emits:
-
-```text
-InterestCapitalized
-```
-
-This creates the single required ledger credit at the end of Day 6.
-
-By construction:
-
-```text
-capitalized interest
-=
-sum of rounded daily accruals
-```
-
-No remainder is discarded.
-
----
-
-
-
-## 40. Backdated changes and interest
-
-A backdated transaction can also change historical positive balances and therefore change previously calculated interest accruals.
-
-Historical reconciliation must therefore consider:
-
-```text
-daily closing balance
-overdraft fee state
-daily interest state
-```
-
-for every affected day.
-
-Because domain events are immutable, previously emitted accrual events are never rewritten.
-
-If an accrual needs correction, the correction must be represented explicitly or the effective accrual must be derived from the event stream in a way that preserves the final invariant.
-
-For this exercise, the key invariant is:
-
-```text
-the final effective rounded accrual for each day
-must reflect the corrected historical closing balance
-```
-
-before interest is capitalized on Day 6.
-
----
-
-
-
-## 41. Idempotency of end-of-day processing
-
-A scheduler may retry an end-of-day operation.
-
-Therefore `EndOfDayCommand` must be idempotent.
-
-Before emitting:
-
-```text
-OverdraftFeeAssessed
-```
-
-the aggregate checks whether an effective fee already exists for that account/day.
-
-Before emitting:
-
-```text
-DailyInterestAccrued
-```
-
-the aggregate checks whether that day's accrual has already been recorded for the current effective history.
-
-The event stream is the source of truth for determining whether an end-of-day action has already occurred.
-
----
-
-
-
-## 42. Backdated events after end-of-day processing
-
-An end-of-day calculation is not necessarily permanently final because later commands may have earlier value dates.
-
-E7 demonstrates this:
-
-```text
-received Day 5
-value_date Day 2
-```
-
-If Day 2 has already been processed, E7 changes its historical closing balance.
-
-Therefore a backdated monetary command triggers historical reconciliation from its value date forward.
-
-Conceptually:
-
-```text
-backdated command
-      |
-      v
-ReconcileFromDayCommand(accountId, affectedDay)
-```
-
-The reconciliation reevaluates:
-
-```text
-daily balances
-overdraft fees
-interest accruals
-```
-
-for the affected day and later days in the six-day window.
-
----
-
-
-
-## 43. Take-home scheduling implementation
-
-The exercise does not require a real scheduler or cron infrastructure.
-
-`ReplayMain` simulates production behavior by issuing the same commands at the appropriate points in the six-day replay.
-
-Conceptually:
-
-```text
-ReplayMain
-
-process Day 1 commands
-↓
-EndOfDayCommand for every account
-
-process Day 2 commands
-↓
-EndOfDayCommand for every account
-
-...
-
-process Day 6 commands
-↓
-EndOfDayCommand for every account
-↓
-CapitalizeInterestCommand for every account
-```
-
-This keeps scheduling infrastructure out of scope while preserving the domain boundary that would exist in production.
-
----
-
-
-
-## 44. E10 instalments
-
-E10 credits:
-
-```text
-BHD 10.000
-```
-
-as three instalments.
-
-Using minor units:
-
-```text
-10000 / 3
-=
-3333 remainder 1
-```
-
-The residual is allocated deterministically:
-
-```text
-3334
-3333
-3333
-```
-
-which represents:
-
-```text
-BHD 3.334
-BHD 3.333
-BHD 3.333
-```
-
-and totals exactly:
-
-```text
-BHD 10.000
-```
-
-No money is created or discarded.
-
----
-
-
-
-## 45. E10 value date
-
-Only one value date is supplied:
-
-```text
-Day 5
-```
-
-No instalment schedule is provided.
-
-Therefore all three generated monetary postings use:
-
-```text
-value_date = Day 5
-```
-
-No additional dates are invented.
-
----
-
-
-
-## 46. Daily reporting projection
-
-The task requires reporting:
-
-```text
-per day
-per account
-```
-
-including:
-
-```text
-closing ledger balance
-fee assessments
-authorization states
-errors
-```
-
-This is represented as a derived projection.
-
-Conceptually:
-
-```java
-public record DailySnapshot(
-    String accountId,
-    int day,
-    long ledgerBalanceInMinorUnits,
-    long activeHoldInMinorUnits,
-    long availableBalanceInMinorUnits,
-    List<FeeAssessment> fees,
-    Map<String, AuthorizationStatus> authorizations,
-    List<LedgerError> errors
-) {}
-```
-
-This snapshot is not authoritative.
-
-It can be regenerated from domain events.
-
----
-
-
-
-## 47. Snapshot versus event store
-
-The distinction is:
-
-```text
-Event Store
-=
-source of truth
-
-AccountSnapshot
-=
-fast current projection
-
-Ledger
-=
-monetary projection
-
-DailySnapshot
-=
-reporting projection
-```
-
-A projection may be updated or rebuilt.
-
-Domain events are never rewritten.
-
----
-
-
-
-## 48. Projection recovery
-
-If a snapshot becomes unavailable or inconsistent, it can be rebuilt.
-
-Conceptually:
-
-```text
-empty AccountSnapshot
-       +
-replay account events
-       =
-rebuilt AccountSnapshot
-```
-
-The same principle applies to:
-
-```text
-ledger projection
-daily reporting projection
-```
-
-This rebuildability is one of the main benefits of the chosen architecture.
-
----
-
-
-
-## 49. Concurrency model
-
-Concurrency is handled per account stream.
-
-Different accounts can be processed independently:
-
-```text
-ACC-001
-ACC-002
-```
-
-Operations against the same account use optimistic concurrency through stream versioning.
-
-This avoids a global lock while ensuring two account decisions cannot both commit against the same stream version.
-
----
-
-
-
-## 50. Production read performance
-
-A production account could have a very large event stream.
-
-Reading every historical event for every authorization would be inefficient.
-
-Therefore the hot authorization path would normally use:
-
-```text
-AccountSnapshot
-```
-
-for current state.
-
-If the snapshot represents version N and the stream is at version N, it can be used immediately.
-
-If newer events exist, the snapshot must first catch up before the business decision is made.
-
----
-
-
-
-## 51. Production write consistency
-
-The critical guarantee is:
-
-```text
-read state at version N
-+
-make business decision
-+
-append only if stream is still version N
-```
-
-If the stream changed meanwhile, the operation is retried.
-
-This is particularly important for authorization because available balance must not be evaluated against stale state.
-
----
-
-
-
-## 52. Why not a traditional mutable account row
-
-A simple model such as:
-
-```text
-accounts.balance
-accounts.active_hold
-```
-
-would make current reads easy but would make historical corrections and reconstruction harder.
-
-The requirements explicitly include:
-
-```text
-backdated transactions
-reversals
-append-only history
-historical fee recalculation
-```
-
-Those requirements benefit from retaining the full sequence of immutable account decisions.
-
-For this task, that benefit outweighs the additional event-sourcing complexity.
-
----
-
-
-
-## 53. Complexity trade-off
-
-Event sourcing adds:
-
-```text
-event versioning
-projection maintenance
-replay logic
-optimistic concurrency
-historical reconciliation
-```
-
-that a simple mutable model would not require.
-
-The benefit is:
-
-```text
-auditability
-historical reconstruction
-deterministic replay
-safe reversals
-projection rebuildability
-```
-
-For this particular ledger problem, those benefits align closely with the requirements.
-
----
-
-
-
-## 54. Main invariants
-
-
-
-### Event immutability
-
-Stored domain events are never mutated or deleted.
-
-### Stream ordering
-
-Each account event stream has one deterministic version sequence.
-
-### Optimistic concurrency
-
-Only one event may occupy a given:
-
-```text
-(accountId, version)
-```
-
-pair.
-
-### Monetary precision
-
-Booked money is stored in exact integer minor units.
-
-### Authorization
-
-An approved authorization must not make available balance negative.
-
-### Hold behavior
-
-Authorization holds reduce available balance but not ledger balance.
-
-### Settlement
-
-A settlement must reference a valid approved authorization.
-
-### Reversal
-
-A reversal creates a compensating event instead of deleting the original transaction.
-
-### Overdraft fee
-
-At most one effective overdraft fee applies per account/day.
-
-### Fee reconciliation
-
-Backdated corrections can generate compensating fee-reversal events.
-
-### Interest
-
-Capitalized interest equals exactly the sum of final effective rounded daily accruals.
-
-### Instalments
-
-Generated instalments must conserve the original monetary amount exactly.
-
----
-
-
-
-## 55. Final architecture
-
-```text
-                         External Commands
-                                |
-                                v
-                       +------------------+
-                       | Account Aggregate|
-                       | validate / decide|
-                       +------------------+
-                                |
-                                v
-                       +------------------+
-                       |   Domain Events  |
-                       +------------------+
-                                |
-                                v
-                       +------------------+
-                       |    Event Store   |
-                       | account/version  |
-                       +------------------+
-                          /       |       \
-                         /        |        \
-                        v         v         v
-              +-------------+ +--------+ +--------------+
-              | Account     | | Ledger | | Daily        |
-              | Snapshot    | | View   | | Reporting    |
-              +-------------+ +--------+ +--------------+
-                    |
-                    v
-          available balance /
-          authorization decisions
-```
-
-The central architectural rule is:
-
-```text
-Domain events are truth.
-Everything else is a projection.
-```
-
-The account snapshot exists for fast operational reads.
-
-The monetary ledger exists for financial reporting and balance calculations.
-
-Daily snapshots exist for the required replay output.
-
-All of them can be rebuilt from the immutable account event stream.
-
----
-
-
-
-## 56. Design philosophy
-
-The design prioritizes:
-
-```text
-correctness
-auditability
-historical reconstruction
-monetary conservation
-safe concurrency
-explicit value-date semantics
-clear trade-offs
-```
-
-The implementation remains intentionally small.
-
-The exercise does not require:
-
-```text
-Spring
-database persistence
-Kafka
-distributed projections
-external caches
-web APIs
-real cron infrastructure
-```
-
-so those are not introduced.
-
-The event-sourcing pattern is used because it directly supports the hardest requirements of the exercise, not because event sourcing is assumed to be universally better than a traditional ledger implementation.
+## 10. Tests that lock the architecture
+
+- `AccountsModuleTest` — handlers constructed with `UnitOfWorkFactory` only
+- `InMemoryUnitOfWorkTest` — handlers stub `UnitOfWork`, not the repository
+- `AccountPutIfAbsentTest` — second append with same key is a no-op on amount
+- `BookCreditTest` / `BookDebitTest` — committed row has both balance fields
+- `ReconciliationTest` — sorted `valueDay` read; existing before/after unchanged

@@ -4,8 +4,14 @@ public sealed interface Command permits
         OpenAccountCommand,
         BookCreditCommand,
         BookDebitCommand,
+        CreditInstalmentsCommand,
         AuthorizeCommand,
-        SettleAuthorizationCommand {
+        SettleAuthorizationCommand,
+        ReverseTransactionCommand,
+        EndOfDayCommand,
+        EndOfDayBatchCommand,
+        ReconcileFromDayCommand,
+        CapitalizeInterestCommand {
 
     String commandId();
 }

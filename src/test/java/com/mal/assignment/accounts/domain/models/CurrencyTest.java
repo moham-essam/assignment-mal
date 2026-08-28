@@ -28,4 +28,10 @@ class CurrencyTest {
         LedgerDomainException error = assertThrows(LedgerDomainException.class, () -> Currency.fromCode("USD"));
         assertEquals(FailureReason.UNKNOWN_CURRENCY, error.error().reason());
     }
+
+    @Test
+    void fromCodeRejectsBlank() {
+        LedgerDomainException error = assertThrows(LedgerDomainException.class, () -> Currency.fromCode(" "));
+        assertEquals(FailureReason.UNKNOWN_CURRENCY, error.error().reason());
+    }
 }
