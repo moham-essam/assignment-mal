@@ -1,0 +1,23 @@
+ledger:
+  window-days: 6
+  rounding-mode: DOWN
+  currencies:
+    AED:
+      scale: 2
+    BHD:
+      scale: 3
+  interest:
+    daily-rate-numerator: 4
+    daily-rate-denominator: 10000
+    capitalization-day: 6
+  overdraft:
+    fees-in-minor-units:
+      AED: 2500
+      BHD: 25000
+  accounts:
+    - id: ACC-001
+      currency: AED
+      opening-balance-in-minor-units: 0
+    - id: ACC-002
+      currency: BHD
+      opening-balance-in-minor-units: 0
