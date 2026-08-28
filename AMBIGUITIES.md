@@ -1,132 +1,139 @@
-# ambiguities.md
+# Ambiguities
 
-This document records only ambiguities that materially affected the implementation.
+This document records ambiguities that materially affected the implementation, and the decisions taken.
+
+---
 
 ## 1. Reversal after overdraft fees were already assessed
 
 ### Ambiguity
 
-E7 is a backdated debit with:
+E7 is a backdated debit (`valueDay` = Day 2). If it makes one or more historical closings negative, the ledger books `OVERDRAFT_FEE` rows on those days.
 
-```text id="m2g7pk"
-value_date = Day 2
-```
+E9 later reverses E7 on the same value day.
 
-If E7 causes one or more historical closing balances to become negative, the system may emit `OverdraftFeeAssessed` events.
-
-Later, E9 reverses E7 with the same historical value date.
-
-The specification does not explicitly state whether previously assessed overdraft fees that existed only because of E7 should remain, or whether the historical fee position should be recalculated.
+The specification does not say whether fees that existed only because of E7 should remain, or whether the historical fee position should be recalculated.
 
 ### Decision
 
-The system recalculates the affected historical balance path from the reversal's `value_date` forward.
+After the reversal commits, `ReconcileFromDayCommand` walks from the original `valueDay` through the last closed day.
 
-If a previously assessed fee is no longer justified, the original fee event remains in the event store and a compensating:
-
-```text id="78gixw"
-OverdraftFeeReversed
-```
-
-event is emitted.
-
-The system then continues recalculating later days because reversing an earlier fee changes every subsequent closing balance and may make later fees unnecessary as well.
+If a previously booked fee is no longer justified, the original `OVERDRAFT_FEE` row stays and a compensating `FEE_REVERSAL` is appended. Later days are walked as well, because reversing an earlier fee changes every subsequent close.
 
 ### Reasoning
 
-The overdraft fee is justified by a day's closing ledger balance.
-
-If a backdated reversal changes that closing balance, the condition that originally caused the fee may no longer exist.
-
-At the same time, the event store is append-only.
-
-Therefore the system must not delete the original fee event.
-
-The combination:
-
-```text id="z3ednt"
-OverdraftFeeAssessed
-+
-OverdraftFeeReversed
-```
-
-preserves the historical audit trail while restoring the correct economic outcome.
-
-Historical fee reconciliation runs chronologically from the affected value date forward until no additional fee or fee-reversal events are required.
+The overdraft fee is justified by that day’s postings-only closing. A backdated reversal can remove that condition. The journal is append-only, so the original fee row is not deleted. `OVERDRAFT_FEE` + `FEE_REVERSAL` keeps the audit trail and restores the economic outcome.
 
 ---
 
-## 2. Supplied "events" versus internal commands
+## 2. Supplied “events” versus commands
 
 ### Ambiguity
 
-The specification refers to E1–E10 as an event stream.
-
-However, some entries still require validation before they can be treated as accepted facts.
-
-For example:
-
-```text id="4v5nmo"
-E6
-SETTLEMENT Auth-Z
-```
-
-must be rejected because Auth-Z does not exist.
-
-Treating E6 directly as an authoritative settlement event would incorrectly imply that the settlement succeeded.
+The specification presents E1–E10 as an event stream. Some of those records still need validation before they can be treated as accepted facts. E6 (`SETTLEMENT Auth-Z`) must be rejected because Auth-Z does not exist. Treating E6 as an already-true settlement would book money that never should have moved.
 
 ### Decision
 
-The supplied E1–E10 records are treated internally as **commands**.
-
-The account aggregate evaluates each command and emits authoritative domain events such as:
-
-```text id="x3j3bt"
-CreditBooked
-DebitBooked
-AuthorizationApproved
-AuthorizationDeclined
-SettlementBooked
-SettlementRejected
-TransactionReversed
-```
-
-These emitted domain events are stored in the event store and form the source of truth.
+E1–E10 are **commands**. The account evaluates each command and either appends ledger / authorization rows or returns a `CommandResult` failure (`UNKNOWN_AUTHORIZATION`, `INSUFFICIENT_AVAILABLE_BALANCE`, `NOT_REVERSIBLE`, …). The append-only ledger is the financial source of truth. Rejected commands do not create postings.
 
 ### Reasoning
 
-A command describes something the outside world is asking the system to do.
-
-A domain event describes something the system has decided actually happened.
-
-This distinction allows invalid operations such as E6 to remain visible as rejected decisions without incorrectly creating financial postings.
+A command is a request. A ledger row is something the system accepted. That split keeps E6 visible as a declined decision without creating a settlement.
 
 ---
 
-## 3. E10 instalment dates
+## 3. Should authorize check available balance before committing?
 
 ### Ambiguity
 
-E10 is described as:
-
-```text id="mxjs6g"
-CREDIT ACC-002 BHD 10.000
-posted as three equal instalments
-value_date Day 5
-```
-
-The specification requires three instalments but supplies only one value date and no instalment schedule.
+The specification does not say whether an authorization must succeed only when available funds cover the hold, or whether a hold may be approved into a negative available position.
 
 ### Decision
 
-All three booked credit events use:
-
-```text id="ks3e64"
-value_date = Day 5
-```
+**Yes.** Authorize calls `ensureSufficientAvailable` before commit. Available is `amountInMinorUnits - holdAmountInMinorUnits`. If available is too low, the service still commits a `DECLINED` authorization (no hold) and returns `INSUFFICIENT_AVAILABLE_BALANCE` (E8).
 
 ### Reasoning
 
-There is no information that justifies assigning different dates to the instalments.
+A hold reserves spendable funds. Approving a hold the customer cannot cover would let later settlements or debits fight over the same money. Recording `DECLINED` keeps the attempt auditable without applying the hold.
 
-Using Day 5 for all three preserves the supplied financial effective date and avoids inventing future dates.
+---
+
+## 4. May a debit take the booked amount below zero?
+
+### Ambiguity
+
+E7 is AED −620.00 on Day 2 against a Day 2 close of AED 250.00. The specification can be read as “reject the debit” or “book it and treat the overdraft as a closing-balance problem.”
+
+### Decision
+
+**Debit is allowed to go negative.** `BookDebitCommand` does not call `ensureSufficientAvailable`. E7 books. Overdraft fees and interest are assessed from the resulting closings, and E9 can reverse the debit.
+
+### Reasoning
+
+Overdraft in this assignment is a value-day closing condition with a fee, not a gate on the debit command. Rejecting E7 would make E9 (`NOT_REVERSIBLE`) and would hide the Day 2 / Day 4 / Day 5 fee path the scenario is built around.
+
+---
+
+## 5. Overdraft uses ledger closing, not available (holds excluded from the test)
+
+### Ambiguity
+
+Available already subtracts holds. It is unclear whether a day is overdrawn when **booked ledger closing** is negative, or when **available** (closing minus outstanding holds) is negative.
+
+### Decision
+
+Overdraft is assessed only when **postings-only closing < 0**. Holds are not subtracted for that test. A day can have a large Auth-A hold and still accrue interest if the booked close is positive (Days 2–3). A fee is booked only for a negative ledger close, once per day (`netFee == 0`).
+
+### Reasoning
+
+Holds are reservations, not ledger postings. Charging an overdraft fee because of a hold would punish money that is still on the book. Settlement (E5) is the posting that can actually drive the close negative.
+
+---
+
+## 6. Interest rounding mode
+
+### Ambiguity
+
+Daily interest is described as 0.04% per day. The specification does not say how to round a fractional minor unit (for example AED 250.00 × 4 / 10000 = 0.10 exactly, but AED 465.00 × 4 / 10000 = 0.186).
+
+### Decision
+
+Rounding mode is **DOWN** (truncate toward zero for positive accruals): `(closing × 4) / 10000` in integer minor units. Configured as `ledger.rounding-mode: DOWN`. Zero or negative closing accrues `0`. Capitalization is the **sum of those daily accruals**, not a separately rounded total.
+
+Examples: `25000 → 10`, `65000 → 26`, `46500 → 18`.
+
+### Reasoning
+
+Integer division with DOWN is deterministic, matches “no remainder left over after capitalization” when cap = sum of daily floors, and avoids inventing HALF_UP behaviour the spec never stated.
+
+---
+
+## 7. E10 instalment dates
+
+### Ambiguity
+
+E10 is a BHD 10.000 credit as three equal instalments with a single value date (Day 5) and no instalment schedule.
+
+### Decision
+
+All three rows (`E10:1`, `E10:2`, `E10:3`) use `valueDay = 5`. Amounts are `3334 / 3333 / 3333` minor units so the total stays BHD 10.000.
+
+### Reasoning
+
+Nothing in the spec justifies spreading instalments onto later days. Using Day 5 for all three keeps the supplied effective date. Identical 3.334 thirds would sum to 10.002; that extra 0.002 is recorded in [REJECTED.md](REJECTED.md).
+
+---
+
+## 8. BHD overdraft fee amount
+
+### Ambiguity
+
+The AED overdraft fee is AED 25.00. No BHD fee is given, and ACC-002 can in principle overdraw.
+
+### Decision
+
+BHD fee is **25.000** (25_000 minor units), the same 25 major-unit figure as AED, stored in `application.yaml`.
+
+### Reasoning
+
+The assignment needs a configured integer per currency. Using the same major-unit size as AED is explicit and invented; it is not derived from a hidden formula in the spec.

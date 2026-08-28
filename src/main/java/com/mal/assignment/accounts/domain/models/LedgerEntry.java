@@ -1,5 +1,11 @@
 package com.mal.assignment.accounts.domain.models;
 
+/**
+ * Append-only journal row. {@code balanceBeforeInMinorUnits} / {@code balanceAfterInMinorUnits}
+ * are the booked amount at append time. They match a day's close only while this row is the
+ * last entry of that value day; a later append with the same or an earlier {@code valueDay}
+ * leaves them stale. Closing uses opening plus signed amounts through {@code valueDay}.
+ */
 public record LedgerEntry(
         String idempotencyKey,
         int valueDay,
