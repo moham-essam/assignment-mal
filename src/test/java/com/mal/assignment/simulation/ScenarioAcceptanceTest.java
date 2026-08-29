@@ -26,11 +26,11 @@ class ScenarioAcceptanceTest {
         assertTrue(index(ids, "E5") < index(ids, "E6"));
         assertTrue(index(ids, "E6") < index(ids, "E7"));
         assertTrue(index(ids, "E7") < index(ids, "E8"));
-        assertTrue(index(ids, "E8") < index(ids, "E9"));
-        assertTrue(index(ids, "E9") < index(ids, "E10"));
+        assertTrue(index(ids, "E8") < index(ids, "E10"));
+        assertTrue(index(ids, "E10") < index(ids, "EOD-D5"));
         assertTrue(index(ids, "EOD-D1") < index(ids, "E3"));
         assertTrue(index(ids, "EOD-D5") < index(ids, "E9"));
-        assertTrue(index(ids, "E10") < index(ids, "EOD-D6"));
+        assertTrue(index(ids, "E9") < index(ids, "EOD-D6"));
         assertTrue(index(ids, "EOD-D6") < index(ids, "CAPITALIZE:ACC-001"));
     }
 

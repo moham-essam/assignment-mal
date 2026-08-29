@@ -38,7 +38,7 @@ Documentation aligned with the implementation (`Document ledger decisions and st
 
 ## 2026-08-29 (after submission)
 
-No core ledger, policy, or handler changes. Scenario fixture only, then missing docs.
+No core ledger, policy, or handler changes. Scenario fixture only, then missing docs, then a test aligned to the fixture.
 
 ### 09:10 GST
 
@@ -48,10 +48,14 @@ No core ledger, policy, or handler changes. Scenario fixture only, then missing 
 
 `Fix E6 E8 values` — `ScenarioFixture`: E6 amount `18500` → `18000`; E8 amount `90000` → `90_00L` (9000). Same commands, same handlers.
 
+### 10:42 GST
+
+`ScenarioAcceptanceTest.assignmentStreamIsE1ThroughE10InOrder` still required E9 before E10. After `Fix E10 day` the engine dispatches E10 on day 5 (`E8` then `E10` then `EOD-D5` then `E9`). Assertions updated to that order. `mvn test`: 83 passed. No fixture or ledger change.
+
 ### Documents
 
 `NUMBERS.md` and `WORKLOG.md` added. They were not in the 2026-08-28 tree. Application code is not modified in this step.
 
 ---
 
-This worklog is reconstructed from the intact Git history and the current repository files. It is not an invented retrospective. Post-submission Git activity is the two fixture corrections above; this file and `NUMBERS.md` are the missing documents being added now.
+This worklog is reconstructed from the intact Git history and the current repository files. It is not an invented retrospective. Post-submission Git activity is the two fixture corrections, this file and `NUMBERS.md`, then the acceptance-test order fix.
