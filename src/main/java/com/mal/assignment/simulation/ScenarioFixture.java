@@ -24,8 +24,8 @@ public final class ScenarioFixture {
                 new ScheduledCommand(4, new SettleAuthorizationCommand("E6", "ACC-001", "Auth-Z", 4, 18_500L)),
                 new ScheduledCommand(5, new BookDebitCommand("E7", "ACC-001", 2, 62_000L, "E7")),
                 new ScheduledCommand(5, new AuthorizeCommand("E8", "ACC-001", "Auth-B", 90_000L)),
-                new ScheduledCommand(6, new ReverseTransactionCommand("E9", "ACC-001", "E7")),
-                new ScheduledCommand(6, new CreditInstalmentsCommand("E10", "ACC-002", 5, 10_000L, 3))
+                new ScheduledCommand(5, new CreditInstalmentsCommand("E10", "ACC-002", 5, 10_000L, 3)),
+                new ScheduledCommand(6, new ReverseTransactionCommand("E9", "ACC-001", "E7"))
         );
     }
 }
